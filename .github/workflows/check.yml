@@ -9,7 +9,7 @@ name: VPN Gate Node Check
 
 on:
   schedule:
-    - cron: '*/120 * * * *'   # 2小时一次，改成你自己的节奏
+    - cron: '0 */2 * * *'   # 每2小时整点运行一次
   workflow_dispatch:
     inputs:
       max_nodes:
@@ -120,6 +120,9 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
+      - name: Wait for artifact propagation
+        run: sleep 5
 
       - name: Deploy to GitHub Pages
         id: deployment
