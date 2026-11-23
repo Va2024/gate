@@ -289,6 +289,7 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    max_latency_ms: int = 0
 
     @classmethod
     def load(cls) -> "Config":
@@ -323,6 +324,7 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            max_latency_ms=_env_int("MAX_LATENCY_MS", 0),
         )
 
 
@@ -825,9 +827,9 @@ def build_outputs(
     }
 
 
-def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
-    if not edge_hosts:
-        raise ConfigError("优选入口池为空，无法生成 nodes.txt")
+def _format_nodes_lines(
+    data: dict[str, Any], edge_hosts: list[str], cfg: Config, max_latency_ms: int
+) -> list[str]:
     lines: list[str] = []
     seen_links: set[str] = set()
     index = 0
@@ -837,8 +839,14 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
     )
     for code, group in ordered:
         name = COUNTRY_ZH.get(code) or group.get("name") or code
+        raw_nodes = group["nodes"]
+        if max_latency_ms > 0:
+            raw_nodes = [
+                n for n in raw_nodes
+                if n.get("latency_ms") is not None and n["latency_ms"] <= max_latency_ms
+            ]
         nodes = sorted(
-            group["nodes"],
+            raw_nodes,
             key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0),
         )
         residential = [n for n in nodes if n.get("residential") == "residential"]
@@ -856,6 +864,16 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
             entry = edge_hosts[index % len(edge_hosts)]
             index += 1
             lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
+    return lines
+
+
+def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
+    if not edge_hosts:
+        raise ConfigError("优选入口池为空，无法生成 nodes.txt")
+    lines = _format_nodes_lines(data, edge_hosts, cfg, cfg.max_latency_ms)
+    if not lines and cfg.max_latency_ms > 0:
+        log("OUTPUT", f"所有节点延迟均超过 {cfg.max_latency_ms}ms，回退为不限延迟输出")
+        lines = _format_nodes_lines(data, edge_hosts, cfg, 0)
     return "\n".join(lines) + ("\n" if lines else "")
 
 

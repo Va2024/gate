@@ -9,7 +9,7 @@ name: VPN Gate Node Check
 
 on:
   schedule:
-    - cron: '0 */2 * * *'   # 每2小时整点运行一次
+    - cron: '*/30 * * * *'   # 每30分钟运行一次
   workflow_dispatch:
     inputs:
       max_nodes:
@@ -70,6 +70,7 @@ jobs:
           CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
           CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '25' }}
           MAX_CHECK_NODES: ${{ github.event.inputs.max_nodes || '0' }}
+          MAX_LATENCY_MS: '3000'
           MIN_SUCCESS_RATIO: '0'
         run: python vpngate.py
 
