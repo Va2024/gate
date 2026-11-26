@@ -21,6 +21,8 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,22 +58,22 @@ DEFAULT_OPTIMAL_API = ""
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
 
-# 静态优选域名池（可用 EDGE_HOSTS 整体覆盖）
+# 静态优选域名池（均经中国大陆 Alidns/DNSPod 解析 + Cloudflare WebSocket 101 实测通过；可用 EDGE_HOSTS 覆盖）
 DEFAULT_EDGE_HOSTS = [
-    "saas.sin.fan:443",
-    "www.mfyx.cn:443",
-    "cf.nyanya.moe:443",
+    "www.visa.com.hk:443",
+    "visa.com.hk:443",
+    "visa.com.sg:443",
+    "visa.co.jp:443",
+    "icook.hk:443",
+    "icook.tw:443",
+    "time.is:443",
+    "singapore.com:443",
+    "japan.com:443",
+    "malaysia.com:443",
+    "cf.090227.xyz:443",
     "cf.877774.xyz:443",
-    "cdn.204910.best:443",
-    "cdn.ctn32.us.kg:443",
-    "p.etime.vip:443",
-    "cmcc.vvvv.ee:443",
-    "cfsaas.080112.xyz:443",
-    "cdn.aneko.ink:443",
-    "hk.cf.3666888.xyz:443",
-    "best.hzample.kdns.fr:443",
-    "ctsg.cfyx.aliyun.20237737.xyz:443",
-    "china-unicom.cname.cloudflare.468123.xyz:443",
+    "cf.nyanya.moe:443",
+    "saas.sin.fan:443",
 ]
 
 DATA_CENTER_ORG_KEYWORDS = [
@@ -290,6 +292,7 @@ class Config:
     max_residential_per_country: int
     max_datacenter_per_country: int
     max_latency_ms: int = 0
+    verify_edge_hosts: bool = False
 
     @classmethod
     def load(cls) -> "Config":
@@ -325,6 +328,8 @@ class Config:
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
             max_latency_ms=_env_int("MAX_LATENCY_MS", 0),
+            verify_edge_hosts=os.environ.get("VERIFY_EDGE_HOSTS", "").strip().lower()
+            in {"1", "true", "yes"},
         )
 
 
@@ -748,6 +753,96 @@ def fetch_optimal_endpoints(cfg: Config, session: requests.Session) -> list[str]
     return endpoints
 
 
+def _split_endpoint(endpoint: str) -> tuple[str, int] | None:
+    if endpoint.startswith("["):
+        match = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})", endpoint)
+        if not match:
+            return None
+        return match.group(1), int(match.group(2))
+    if ":" not in endpoint:
+        return None
+    host, port_str = endpoint.rsplit(":", 1)
+    return host, int(port_str)
+
+
+def _resolve_cn_ipv4(host: str, session: requests.Session, timeout: float = 4.0) -> list[str]:
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+        return [host]
+    if ":" in host:
+        return [host]
+    try:
+        resp = session.get(
+            "https://dns.alidns.com/resolve",
+            params={"name": host, "type": "A"},
+            headers={"Accept": "application/dns-json"},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            answers = payload.get("Answer") or []
+            return [str(a["data"]) for a in answers if a.get("type") == 1 and a.get("data")]
+    except Exception:  # noqa: BLE001 - DoH 不可达时回退系统 DNS
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET)
+        return sorted({str(info[4][0]) for info in infos if info[4]})
+    except OSError:
+        return []
+
+
+def probe_edge_endpoint(
+    endpoint: str,
+    probe_host: str,
+    session: requests.Session,
+    timeout: float = 5.0,
+) -> bool:
+    parsed = _split_endpoint(endpoint)
+    if not parsed or not probe_host:
+        return False
+    host, port = parsed
+    ips = _resolve_cn_ipv4(host, session, timeout=min(timeout, 4.0))
+    if not ips:
+        return False
+    ctx = ssl.create_default_context()
+    req_bytes = (
+        f"GET /ip.json HTTP/1.1\r\n"
+        f"Host: {probe_host}\r\n"
+        f"User-Agent: Mozilla/5.0\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii", errors="ignore")
+    try:
+        with socket.create_connection((ips[0], port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=probe_host) as tls_sock:
+                tls_sock.sendall(req_bytes)
+                head = tls_sock.recv(256).decode("latin1", errors="ignore")
+        first_line = head.splitlines()[0] if head else ""
+        return bool(re.match(r"^HTTP/\d(?:\.\d)?\s+200\b", first_line))
+    except OSError:
+        return False
+
+
+def filter_healthy_edge_hosts(
+    endpoints: list[str],
+    probe_host: str,
+    session: requests.Session,
+) -> list[str]:
+    if not endpoints or not probe_host:
+        return endpoints
+    with ThreadPoolExecutor(max_workers=min(16, len(endpoints))) as pool:
+        checks = list(
+            pool.map(lambda ep: (ep, probe_host and probe_edge_endpoint(ep, probe_host, session)), endpoints)
+        )
+    healthy = [ep for ep, ok in checks if ok]
+    dropped = [ep for ep, ok in checks if not ok]
+    if dropped:
+        log("EDGE POOL", f"入口连通性过滤剔除不可用端点 {len(dropped)} 个: {', '.join(dropped[:8])}")
+    if not healthy:
+        log("EDGE POOL", "所有入口探测均未通过（可能处于离线测试环境），保留原候选池兜底")
+        return endpoints
+    log("EDGE POOL", f"入口连通性校验通过 {len(healthy)}/{len(endpoints)} 个")
+    return healthy
+
+
 def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]:
     api_endpoints = fetch_optimal_endpoints(cfg, session)
     combined: list[str] = []
@@ -762,6 +857,9 @@ def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]
         "EDGE POOL",
         f"入口地址池: 静态/配置 {len(cfg.edge_hosts)} 个, API {len(api_endpoints)} 个, 合并 {len(combined)} 个",
     )
+    if cfg.verify_edge_hosts:
+        probe_host = urlsplit(cfg.worker_base).hostname or ""
+        combined = filter_healthy_edge_hosts(combined, probe_host, session)
     return combined
 
 

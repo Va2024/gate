@@ -299,3 +299,26 @@ def test_atomic_write_text(tmp_path):
     vpngate.atomic_write_text(str(target), "line1\nline2\n")
     assert target.read_text(encoding="utf-8") == "line1\nline2\n"
     assert list(target.parent.glob("*.tmp-*")) == []
+
+
+def test_filter_healthy_edge_hosts_drops_dead_and_falls_back(monkeypatch):
+    monkeypatch.setattr(
+        vpngate,
+        "probe_edge_endpoint",
+        lambda ep, host, session: ep == "good.example.com:443",
+    )
+    session = vpngate.make_session()
+    kept = vpngate.filter_healthy_edge_hosts(
+        ["dead.example.com:443", "good.example.com:443"],
+        "check5.example.com",
+        session,
+    )
+    assert kept == ["good.example.com:443"]
+
+    monkeypatch.setattr(vpngate, "probe_edge_endpoint", lambda ep, host, session: False)
+    fallback = vpngate.filter_healthy_edge_hosts(
+        ["dead1.example.com:443", "dead2.example.com:443"],
+        "check5.example.com",
+        session,
+    )
+    assert fallback == ["dead1.example.com:443", "dead2.example.com:443"]
